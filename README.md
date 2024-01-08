@@ -1,11 +1,12 @@
 # Fastly Http Client for the AWS Rust SDK
-The `aws-fastly-http-client` crate allows you to use the AWS Rust SDK on Fastly Compute@Edge by providing an HTTP client
+The `aws-fastly-http-client` crate allows you to use the AWS Rust SDK on Fastly Compute @ Edge. The crate contains an
+implementation of [HttpClient](https://docs.rs/aws-sdk-config/latest/aws_sdk_config/config/trait.HttpClient.html)
 you can plug into the AWS Rust SDK. We've only used this with the [aws-sdk-dynamodb](https://crates.io/crates/aws-sdk-dynamodb)
 but it should work with other services as well.
 
 ## Blocking
-Sadly this HTTP client blocks. So you can't for instance send two parallel Query requests to DynamoDB. The blocking
-version of the HTTP client got the job done for us, but feel free to help out and make it async.
+Sadly this HTTP client blocks. So you can't send two parallel Query requests to DynamoDB. The blocking version of the
+HTTP client got the job done for us, but feel free to help out and make it async.
 
 ## Dependencies
 We found that we needed to disable all default features of the AWS Rust SDK to make our project build for Fastly
