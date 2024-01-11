@@ -4,10 +4,6 @@ implementation of [HttpClient](https://docs.rs/aws-sdk-config/latest/aws_sdk_con
 you can plug into the AWS Rust SDK. We've only used this with the [aws-sdk-dynamodb](https://crates.io/crates/aws-sdk-dynamodb)
 but it should work with other services as well.
 
-## Blocking
-Sadly this HTTP client blocks. So you can't send two parallel Query requests to DynamoDB. The blocking version of the
-HTTP client got the job done for us, but feel free to help out and make it async.
-
 ## Dependencies
 We found that we needed to disable all default features of the AWS Rust SDK to make our project build for Fastly
 Compute@Edge. For example, if you're adding the `aws-sdk-dynamodb` crate, you'll need to add this to your `Cargo.toml`:
@@ -16,16 +12,22 @@ Compute@Edge. For example, if you're adding the `aws-sdk-dynamodb` crate, you'll
 aws-sdk-dynamodb = { version = "1.9.0", default-features = false }
 ```
 
+Additionally, we rely on Tokio for some of the async stuff, so you might want to add this to your `Cargo.toml` and use
+the `tokio::main` macro.
+```toml
+tokio = { version = "1.35.1", features = ["macros", "rt"] }
+```
+
 ## Usage
 AWS's Rust SDK allows you to control a lot of stuff related to networking, but since Fastly handles that for us, most of
-the networking things must be disabled. Here's an example of a `SdkConfig` that worked for us:
+the networking things can be disabled. Here's an example with a `SdkConfig` that worked for us:
+
 ```rust
-fn dynamodb_client() -> aws_sdk_dynamodb::Client {
-    let sender = DefaultSender::from("my_backend_name");
-    let http_client = FastlyHttpClient::from(sender);
-    
-    let config = SdkConfig::builder()
-        .region(region())
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let http_client = FastlyHttpClient::from("my_backend_name");
+    let config = aws_sdk_dynamodb::Config::builder()
+        .region(Some(Region::from_static("us-east-1")))
         .credentials_provider(credentials_provider())
         .retry_config(RetryConfig::disabled())
         .timeout_config(TimeoutConfig::disabled())
@@ -35,7 +37,22 @@ fn dynamodb_client() -> aws_sdk_dynamodb::Client {
         .behavior_version(BehaviorVersion::v2023_11_09())
         .build();
 
-    aws_sdk_dynamodb::Client::new(&config)
+    let client = aws_sdk_dynamodb::Client::from_conf(config);
+
+    let request = Request::from_client();
+    let result = client
+        .get_item()
+        .table_name("paths")
+        .key("path", AttributeValue::S(request.get_path().to_string()))
+        .send()
+        .await
+        .unwrap();
+
+    let response = match result.item {
+        Some(_) => Response::from_status(StatusCode::OK),
+        None => Response::from_status(StatusCode::NOT_FOUND),
+    };
+
+    response.send_to_client()
 }
 ```
-

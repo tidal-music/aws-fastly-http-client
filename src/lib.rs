@@ -1,7 +1,10 @@
 use std::convert::TryFrom;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
 };
@@ -10,28 +13,18 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::body::SdkBody;
 use fastly::convert::ToBackend;
-use fastly::http::request::{SendError, SendErrorCause};
-use fastly::Backend;
+use fastly::http::request::{PendingRequest, PollResult, SendError, SendErrorCause};
+use fastly::{Backend, Body, Request, Response};
+use futures::TryFutureExt;
+use tokio::time::sleep;
 
-/// Sends a [fastly::Request]. This trait can be implemented to contain your own transmission logic such as logging.
-pub trait Sender: Clone + Debug + Send + Sync + 'static {
-    /// Sends the [fastly::Request] and returns a result containing a [fastly::Response] or a [SendError].
-    fn send(&self, request: fastly::Request) -> Result<fastly::Response, SendError>;
-}
-
-/// A [Sender] implementation that uses [fastly::Request::send] to transmit the request.
-#[derive(Clone, Debug)]
-pub struct DefaultSender {
+/// An HTTP client for communicating with AWS services. This is what you'll insert into your config.
+#[derive(Debug)]
+pub struct FastlyHttpClient {
     backend: Backend,
 }
 
-impl Sender for DefaultSender {
-    fn send(&self, request: fastly::Request) -> Result<fastly::Response, SendError> {
-        request.send(&self.backend)
-    }
-}
-
-impl<T: ToBackend> From<T> for DefaultSender {
+impl<T: ToBackend> From<T> for FastlyHttpClient {
     fn from(backend: T) -> Self {
         Self {
             backend: backend.into_owned(),
@@ -39,119 +32,120 @@ impl<T: ToBackend> From<T> for DefaultSender {
     }
 }
 
-/// An HTTP client for communicating with AWS services. This is what you'll insert into the [aws_config::SdkConfig].
-#[derive(Debug)]
-pub struct FastlyHttpClient<T: Sender> {
-    sender: T,
-}
-
-impl<T: Sender> From<T> for FastlyHttpClient<T> {
-    fn from(sender: T) -> Self {
-        Self { sender }
-    }
-}
-
-impl<T: Sender> HttpClient for FastlyHttpClient<T> {
+impl HttpClient for FastlyHttpClient {
     fn http_connector(
         &self,
         _: &HttpConnectorSettings,
         _: &RuntimeComponents,
     ) -> SharedHttpConnector {
-        SharedHttpConnector::new(FastlyHttpConnector::from(self.sender.clone()))
+        SharedHttpConnector::new(FastlyHttpConnector::from(self.backend.clone()))
     }
 }
 
 #[derive(Debug)]
-pub struct FastlyHttpConnector<T: Sender> {
-    sender: T,
+struct FastlyHttpConnector {
+    backend: Backend,
 }
 
-impl<T: Sender> From<T> for FastlyHttpConnector<T> {
-    fn from(sender: T) -> Self {
-        Self { sender }
+impl From<Backend> for FastlyHttpConnector {
+    fn from(backend: Backend) -> Self {
+        Self { backend }
     }
 }
 
-impl<T: Sender> HttpConnector for FastlyHttpConnector<T> {
+impl HttpConnector for FastlyHttpConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let request = Request::from(request);
+        let request = Request::from_http_request(request);
 
-        match request.send_with(&self.sender) {
-            Ok(response) => HttpConnectorFuture::ready(Ok(response.into())),
-            Err(error) => HttpConnectorFuture::ready(Err(error.into())),
-        }
-    }
-}
-
-struct Request(fastly::Request);
-
-impl Request {
-    fn send_with(self, sender: &impl Sender) -> Result<Response, Error> {
-        sender.send(self.0).map(Response).map_err(Error)
-    }
-}
-
-impl From<HttpRequest> for Request {
-    fn from(request: HttpRequest) -> Self {
-        let to_fastly_body = |body: SdkBody| {
-            body.bytes()
-                .map(fastly::Body::from)
-                .unwrap_or(fastly::Body::new())
+        let future = match request.send_async(&self.backend) {
+            Ok(pending_request) => ResponseFuture::from(pending_request),
+            Err(error) => return HttpConnectorFuture::ready(Err(into_connector_error(error))),
         };
 
-        let request = request
+        let response = future
+            .map_ok(into_http_response)
+            .map_err(into_connector_error);
+
+        HttpConnectorFuture::new_boxed(Box::pin(response))
+    }
+}
+
+trait FromHttpRequest {
+    fn from_http_request(request: HttpRequest) -> Self;
+}
+
+impl FromHttpRequest for Request {
+    fn from_http_request(request: HttpRequest) -> Self {
+        let to_fastly_body = |body: SdkBody| body.bytes().map(Body::from).unwrap_or(Body::new());
+
+        request
             .map(to_fastly_body)
             .try_into_http02x()
             .map(fastly::Request::from)
-            .unwrap();
-
-        Self(request)
+            .unwrap()
     }
 }
 
-struct Response(fastly::Response);
+fn into_http_response(response: Response) -> HttpResponse {
+    let response: http::Response<Body> = response.into();
+    let to_sdk_body = |body: Body| SdkBody::from(body.into_bytes());
+    HttpResponse::try_from(response.map(to_sdk_body)).unwrap()
+}
 
-impl From<fastly::Response> for Response {
-    fn from(response: fastly::Response) -> Self {
-        Self(response)
+fn into_connector_error(error: SendError) -> ConnectorError {
+    match error.root_cause() {
+        SendErrorCause::BufferSize(_)
+        | SendErrorCause::DnsError { .. }
+        | SendErrorCause::ConnectionRefused
+        | SendErrorCause::ConnectionTerminated
+        | SendErrorCause::ConnectionLimitReached
+        | SendErrorCause::TlsProtocolError
+        | SendErrorCause::TlsAlertReceived { .. }
+        | SendErrorCause::TlsConfigurationError
+        | SendErrorCause::HttpIncompleteResponse
+        | SendErrorCause::HttpResponseHeaderSectionTooLarge
+        | SendErrorCause::HttpResponseBodyTooLarge
+        | SendErrorCause::HttpProtocolError => ConnectorError::io(Box::new(error)),
+        SendErrorCause::DnsTimeout
+        | SendErrorCause::ConnectionTimeout
+        | SendErrorCause::HttpResponseTimeout => ConnectorError::timeout(Box::new(error)),
+        _ => ConnectorError::other(Box::new(error), None),
     }
 }
 
-impl From<Response> for HttpResponse {
-    fn from(response: Response) -> Self {
-        let response: http::Response<fastly::Body> = response.0.into();
-        let to_sdk_body = |body: fastly::Body| SdkBody::from(body.into_bytes());
-        HttpResponse::try_from(response.map(to_sdk_body)).unwrap()
-    }
+struct ResponseFuture {
+    pending_request: Option<PendingRequest>,
 }
 
-struct Error(SendError);
-
-impl From<Error> for ConnectorError {
-    fn from(error: Error) -> Self {
-        match error.0.root_cause() {
-            SendErrorCause::BufferSize(_)
-            | SendErrorCause::DnsError { .. }
-            | SendErrorCause::ConnectionRefused
-            | SendErrorCause::ConnectionTerminated
-            | SendErrorCause::ConnectionLimitReached
-            | SendErrorCause::TlsProtocolError
-            | SendErrorCause::TlsAlertReceived { .. }
-            | SendErrorCause::TlsConfigurationError
-            | SendErrorCause::HttpIncompleteResponse
-            | SendErrorCause::HttpResponseHeaderSectionTooLarge
-            | SendErrorCause::HttpResponseBodyTooLarge
-            | SendErrorCause::HttpProtocolError => ConnectorError::io(error.into()),
-            SendErrorCause::DnsTimeout
-            | SendErrorCause::ConnectionTimeout
-            | SendErrorCause::HttpResponseTimeout => ConnectorError::timeout(error.into()),
-            _ => ConnectorError::other(error.into(), None),
+impl From<PendingRequest> for ResponseFuture {
+    fn from(pending_request: PendingRequest) -> Self {
+        Self {
+            pending_request: Some(pending_request),
         }
     }
 }
 
-impl From<Error> for BoxError {
-    fn from(val: Error) -> Self {
-        Box::new(val.0)
+impl Future for ResponseFuture {
+    type Output = Result<Response, SendError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let pending_request = self.pending_request.take().unwrap();
+
+        match pending_request.poll() {
+            PollResult::Done(result) => Poll::Ready(result),
+            PollResult::Pending(pending_request) => {
+                self.pending_request = Some(pending_request);
+
+                let waker = cx.waker().clone();
+                let duration = Duration::from_millis(5);
+
+                tokio::spawn(async move {
+                    sleep(duration).await;
+                    waker.wake();
+                });
+
+                Poll::Pending
+            }
+        }
     }
 }
