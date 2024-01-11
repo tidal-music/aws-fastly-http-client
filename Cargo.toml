@@ -12,5 +12,4 @@ aws-config = { version = "1.1.1", default-features = false }
 aws-smithy-runtime-api = { version = "1.1.1", features = ["http-02x"] }
 aws-smithy-types = "1.1.1"
 tokio = { version = "1.35.1", features = ["rt", "time"] }
-time = { version = "0.3.23", features = [] }
 futures = "0.3.30"
