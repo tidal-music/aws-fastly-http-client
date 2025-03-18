@@ -16,6 +16,8 @@ use fastly::convert::ToBackend;
 use fastly::http::request::{PendingRequest, PollResult, SendError, SendErrorCause};
 use fastly::{Backend, Body, Request, Response};
 use futures::TryFutureExt;
+use tokio::sync::oneshot;
+use tokio::task::spawn_local;
 use tokio::time::sleep;
 
 /// An HTTP client for communicating with AWS services. This is what you'll insert into your config.
@@ -66,7 +68,16 @@ impl HttpConnector for FastlyHttpConnector {
             .map_ok(into_http_response)
             .map_err(into_connector_error);
 
-        HttpConnectorFuture::new_boxed(Box::pin(response))
+        let (tx, rx) = oneshot::channel();
+
+        spawn_local(async move {
+            let result = response.await;
+            let _ = tx.send(result);
+        });
+
+        HttpConnectorFuture::new_boxed(Box::pin(async move {
+            rx.await.unwrap_or_else(|e|Err(ConnectorError::io(Box::new(e))))
+        }))
     }
 }
 
@@ -80,8 +91,8 @@ impl FromHttpRequest for Request {
 
         request
             .map(to_fastly_body)
-            .try_into_http02x()
-            .map(fastly::Request::from)
+            .try_into_http1x()
+            .map(Request::from)
             .unwrap()
     }
 }
@@ -94,8 +105,7 @@ fn into_http_response(response: Response) -> HttpResponse {
 
 fn into_connector_error(error: SendError) -> ConnectorError {
     match error.root_cause() {
-        SendErrorCause::BufferSize(_)
-        | SendErrorCause::DnsError { .. }
+        SendErrorCause::DnsError { .. }
         | SendErrorCause::ConnectionRefused
         | SendErrorCause::ConnectionTerminated
         | SendErrorCause::ConnectionLimitReached
@@ -130,7 +140,6 @@ impl Future for ResponseFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let pending_request = self.pending_request.take().unwrap();
-
         match pending_request.poll() {
             PollResult::Done(result) => Poll::Ready(result),
             PollResult::Pending(pending_request) => {
