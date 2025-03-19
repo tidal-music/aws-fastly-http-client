@@ -25,34 +25,39 @@ the networking things can be disabled. Here's an example with a `SdkConfig` that
 ```rust
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let http_client = FastlyHttpClient::from("my_backend_name");
-    let config = aws_sdk_dynamodb::Config::builder()
-        .region(Some(Region::from_static("us-east-1")))
-        .credentials_provider(credentials_provider())
-        .retry_config(RetryConfig::disabled())
-        .timeout_config(TimeoutConfig::disabled())
-        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
-        .identity_cache(IdentityCache::no_cache())
-        .http_client(http_client)
-        .behavior_version(BehaviorVersion::v2023_11_09())
-        .build();
+    LocalSet::new()
+        .run_until(async {
+            let http_client = FastlyHttpClient::from("my_backend_name");
+            let config = aws_sdk_dynamodb::Config::builder()
+                .region(Some(Region::from_static("us-east-1")))
+                .credentials_provider(credentials_provider())
+                .retry_config(RetryConfig::disabled())
+                .timeout_config(TimeoutConfig::disabled())
+                .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+                .identity_cache(IdentityCache::no_cache())
+                .http_client(http_client)
+                .behavior_version(BehaviorVersion::v2023_11_09())
+                .build();
 
-    let client = aws_sdk_dynamodb::Client::from_conf(config);
+            let client = aws_sdk_dynamodb::Client::from_conf(config);
 
-    let request = Request::from_client();
-    let result = client
-        .get_item()
-        .table_name("paths")
-        .key("path", AttributeValue::S(request.get_path().to_string()))
-        .send()
-        .await
-        .unwrap();
+            let request = Request::from_client();
+            let result = client
+                .get_item()
+                .table_name("paths")
+                .key("path", AttributeValue::S(request.get_path().to_string()))
+                .send()
+                .await
+                .unwrap();
 
-    let response = match result.item {
-        Some(_) => Response::from_status(StatusCode::OK),
-        None => Response::from_status(StatusCode::NOT_FOUND),
-    };
+            let response = match result.item {
+                Some(_) => Response::from_status(StatusCode::OK),
+                None => Response::from_status(StatusCode::NOT_FOUND),
+            };
 
-    response.send_to_client()
+            response.send_to_client()
+        }).await;
 }
 ```
+
+Note that `tokio::task::spawn_local` is being used, so `LocalSet` is required.
