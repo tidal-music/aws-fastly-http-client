@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -65,8 +66,8 @@ impl HttpConnector for FastlyHttpConnector {
         };
 
         let response = future
-            .map_ok(into_http_response)
-            .map_err(into_connector_error);
+            .map_err(into_connector_error)
+            .and_then(|response| futures::future::ready(into_http_response(response)));
 
         let (tx, rx) = oneshot::channel();
 
@@ -76,7 +77,8 @@ impl HttpConnector for FastlyHttpConnector {
         });
 
         HttpConnectorFuture::new_boxed(Box::pin(async move {
-            rx.await.unwrap_or_else(|e|Err(ConnectorError::io(Box::new(e))))
+            rx.await
+                .unwrap_or_else(|e| Err(ConnectorError::io(Box::new(e))))
         }))
     }
 }
@@ -97,10 +99,18 @@ impl FromHttpRequest for Request {
     }
 }
 
-fn into_http_response(response: Response) -> HttpResponse {
+fn into_http_response(response: Response) -> Result<HttpResponse, ConnectorError> {
     let response: http::Response<Body> = response.into();
-    let to_sdk_body = |body: Body| SdkBody::from(body.into_bytes());
-    HttpResponse::try_from(response.map(to_sdk_body)).unwrap()
+    let (parts, mut body) = response.into_parts();
+
+    let mut bytes = Vec::new();
+    body.read_to_end(&mut bytes)
+        .map_err(|e| ConnectorError::io(Box::new(e)))?;
+
+    let sdk_body = SdkBody::from(bytes);
+    let response = http::Response::from_parts(parts, sdk_body);
+
+    Ok(HttpResponse::try_from(response).unwrap())
 }
 
 fn into_connector_error(error: SendError) -> ConnectorError {
